@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>Forest Cabin · 动态 3D 森林木屋</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0e0a; }
+    canvas { display: block; outline: none; }
+
+    /* 触控优化：阻止画布上的默认手势干扰，但允许页面本身滚动（如果需要） */
+    canvas { touch-action: none; }
+
+    #loading {
+      position: fixed; inset: 0; z-index: 10;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: #0a0e0a; color: #8fbc8f;
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 14px; letter-spacing: 0.08em;
+      transition: opacity 0.7s ease;
+    }
+    #loading.hidden { opacity: 0; pointer-events: none; }
+
+    .loader-ring {
+      width: 32px; height: 32px; margin-bottom: 16px;
+      border: 2px solid rgba(143, 188, 143, 0.15);
+      border-top-color: #8fbc8f; border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #hint {
+      position: fixed; bottom: max(14px, env(safe-area-inset-bottom));
+      left: 50%; transform: translateX(-50%);
+      color: rgba(200, 220, 200, 0.55);
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 11px; letter-spacing: 0.06em;
+      pointer-events: none; user-select: none;
+      white-space: nowrap; text-align: center; line-height: 1.6;
+      padding: 0 12px;
+    }
+    /* 桌面上显示鼠标操作，手机上显示触控操作 */
+    #hint .desktop { display: inline; }
+    #hint .mobile { display: none; }
+    @media (pointer: coarse) {
+      #hint .desktop { display: none; }
+      #hint .mobile { display: inline; }
+    }
+  </style>
+</head>
+<body>
+  <div id="loading"><div class="loader-ring"></div>正在生成森林…</div>
+  <div id="hint">
+    <span class="desktop">左键拖拽旋转 · 滚轮缩放 · 右键平移</span>
+    <span class="mobile">单指旋转 · 双指缩放/平移</span>
+  </div>
+
+  <!-- 使用 importmap 映射 Three.js 和 addons，路径固定，不依赖不确定的第三方库 -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { ImprovedNoise } from 'three/addons/math/ImprovedNoise.js';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+    // ======================================================================
+    // 1. 设备检测与分级
+    // ======================================================================
+    const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+    const isLowEnd = navigator.hardwareConcurrency <= 4;
+    const hasLimitedMemory = navigator.deviceMemory && navigator.deviceMemory < 4;
+
+    // 移动端或低端设备走“轻量模式”
+    const LITE = isMobile || isLowEnd || hasLimitedMemory;
+
+    // ======================================================================
+    // 2. 渲染器：移动端关闭抗锯齿、限制像素比、使用 mediump
+    // ======================================================================
+    const renderer = new THREE.WebGLRenderer({
+      antialias: !LITE,                         // 移动端关 AA，省性能
+      powerPreference: 'high-performance',
+      precision: LITE ? 'mediump' : 'highp'     // 移动端 mediump 足够，且更快
+    });
+
+    // 像素比：桌面最多 2，移动端最多 1.5，避免高 DPI 拖垮帧率
+    const maxPixelRatio = LITE ? 1.5 : 2;
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, maxPixelRatio));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = !LITE;         // 移动端默认关闭实时阴影
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = LITE ? 1.0 : 1.05;
+    document.body.appendChild(renderer.domElement);
+
+    // ======================================================================
+    // 3. 场景 / 相机
+    // ======================================================================
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x9ab89a); // 兜底背景，天空网格会覆盖
+
+    const camera = new THREE.PerspectiveCamera(
+      50, window.innerWidth / window.innerHeight, 0.1, 300
+    );
+    camera.position.set(18, 9, 26);
+
+    // ======================================================================
+    // 4. 程序化地形：使用 Three.js 内置 ImprovedNoise（Perlin 噪声）
+    // ======================================================================
+    // ImprovedNoise 是 three.js addons 里自带的噪声工具，不依赖外部包[reference:4]
+    const noise = new ImprovedNoise();
+    const TERRAIN_SIZE = 70;
+    const TERRAIN_SEGMENTS = LITE ? 64 : 96; // 移动端降低网格密度
+
+    /**
+     * 高度函数：和地形网格使用同一个噪声，保证树木、草地、木屋都能精确贴地
+     */
+    function heightAt(x, z) {
+      const scale = 0.06;
+      // 多倍频叠加，让地形有起伏但不至于太碎
+      let h = noise.noise(x * scale, 0.5, z * scale) * 3.0;
+      h += noise.noise(x * scale * 2.1, 1.7, z * scale * 2.1) * 1.2;
+      h += noise.noise(x * scale * 4.3, 3.3, z * scale * 4.3) * 0.5;
+
+      // 把中心区域稍微压平，给木屋留出空地
+      const distToCenter = Math.sqrt(x * x + z * z);
+      if (distToCenter < 10) {
+        const factor = distToCenter / 10; // 0 中心 → 1 边缘
+        h *= 0.35 + 0.65 * factor;        // 中心只保留 35% 起伏
+      }
+      return h;
+    }
+
+    function buildTerrain() {
+      const geometry = new THREE.PlaneGeometry(
+        TERRAIN_SIZE, TERRAIN_SIZE,
+        TERRAIN_SEGMENTS, TERRAIN_SEGMENTS
+      );
+      geometry.rotateX(-Math.PI / 2);
+
+      const positions = geometry.attributes.position;
+      const colors = new Float32Array(positions.count * 3);
+      const color = new THREE.Color();
+
+      for (let i = 0; i < positions.count; i++) {
+        const x = positions.getX(i);
+        const z = positions.getZ(i);
+        const y = heightAt(x, z);
+        positions.setY(i, y);
+
+        // 按高度着色：低处深绿，高处偏黄褐
+        const t = THREE.MathUtils.clamp((y + 2) / 5, 0, 1);
+        color.setHSL(0.25 - t * 0.06, 0.35 + t * 0.1, 0.22 + t * 0.12);
+        color.toArray(colors, i * 3);
+      }
+
+      geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geometry.computeVertexNormals();
+
+      // 移动端用 Lambert（逐顶点光照），桌面用 Standard（PBR）
+      const material = LITE
+        ? new THREE.MeshLambertMaterial({ vertexColors: true })
+        : new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, metalness: 0 });
+
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.receiveShadow = !LITE;
+      return mesh;
+    }
+
+    const terrain = buildTerrain();
+    scene.add(terrain);
+
+    // ======================================================================
+    // 5. 天空：简单的渐变天空球（不依赖贴图，移动端也很快）
+    // ======================================================================
+    function buildSky() {
+      const geometry = new THREE.SphereGeometry(150, 32, 16);
+      const material = new THREE.ShaderMaterial({
+        side: THREE.BackSide,
+        uniforms: {
+          topColor:    { value: new THREE.Color(0x4a6fa5) },
+          bottomColor: { value: new THREE.Color(0xc8d8c0) },
+          offset:      { value: 20 },
+          exponent:    { value: 0.6 }
+        },
+        vertexShader: `
+          varying vec3 vWorldPosition;
+          void main() {
+            vec4 worldPos = modelMatrix * vec4(position, 1.0);
+            vWorldPosition = worldPos.xyz;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 topColor;
+          uniform vec3 bottomColor;
+          uniform float offset;
+          uniform float exponent;
+          varying vec3 vWorldPosition;
+          void main() {
+            float h = normalize(vWorldPosition + offset).y;
+            gl_FragColor = vec4(mix(bottomColor, topColor, max(pow(max(h, 0.0), exponent), 0.0)), 1.0);
+          }
+        `
+      });
+      return new THREE.Mesh(geometry, material);
+    }
+    scene.add(buildSky());
+
+    // ======================================================================
+    // 6. 光照与雾
+    // ======================================================================
+    const ambient = new THREE.AmbientLight(0xc8d8c0, LITE ? 0.9 : 0.6);
+    scene.add(ambient);
+
+    const sun = new THREE.DirectionalLight(0xffddaa, LITE ? 1.2 : 1.8);
+    sun.position.set(20, 30, 15);
+    if (!LITE) {
+      sun.castShadow = true;
+      sun.shadow.mapSize.set(1024, 1024);   // 桌面 1024 足够，2048 对普通设备偏重
+      sun.shadow.camera.near = 0.5;
+      sun.shadow.camera.far = 100;
+      sun.shadow.camera.left = -30;
+      sun.shadow.camera.right = 30;
+      sun.shadow.camera.top = 30;
+      sun.shadow.camera.bottom = -30;
+      sun.shadow.bias = -0.0005;
+    }
+    scene.add(sun);
+
+    // 雾：靠近木屋清晰，远处山林淡出
+    scene.fog = new THREE.Fog(0xc8d8c0, 22, 80);
+
+    // ======================================================================
+    // 7. 树木：InstancedMesh 批量渲染
+    // ======================================================================
+    function createTreeGeometry() {
+      // 树干
+      const trunkGeo = new THREE.CylinderGeometry(0.12, 0.18, 1.2, 5);
+      trunkGeo.translate(0, 0.6, 0);
+
+      // 树冠：用 3 层锥体叠出松树形状
+      const layers = [];
+      for (let i = 0; i < 3; i++) {
+        const r = 0.9 - i * 0.22;
+        const h = 1.0 - i * 0.15;
+        const cone = new THREE.ConeGeometry(r, h, 6);
+        cone.translate(0, 1.0 + i * 0.55, 0);
+        layers.push(cone);
+      }
+
+      // 合并几何体（使用 BufferGeometryUtils 可选，这里手动用 Group 更简单，但 InstancedMesh 需要单个 Geometry）
+      // 为了保持单一几何体，这里把树冠简化为一个锥体 + 树干，减少顶点数
+      // 如果追求更精细，可以引入 BufferGeometryUtils.mergeGeometries
+      const canopyGeo = new THREE.ConeGeometry(0.9, 2.2, 6);
+      canopyGeo.translate(0, 1.7, 0);
+
+      // 手动合并 trunk 和 canopy（简单拼接顶点）
+      const merged = new THREE.BufferGeometry();
+      const trunkPos = trunkGeo.attributes.position.array;
+      const canopyPos = canopyGeo.attributes.position.array;
+      const trunkNorm = trunkGeo.attributes.normal.array;
+      const canopyNorm = canopyGeo.attributes.normal.array;
+
+      // 这里为了简洁，不真正合并，而是用两个 InstancedMesh（树干 + 树冠）
+      // 这样代码更清晰，draw call 仍然很少
+      return { trunkGeo, canopyGeo };
+    }
+
+    function addTrees() {
+      const { trunkGeo, canopyGeo } = createTreeGeometry();
+
+      const treeCount = LITE ? 180 : 450; // 移动端减少树木数量
+      const dummy = new THREE.Object3D();
+      const color = new THREE.Color();
+
+      const trunkMat = LITE
+        ? new THREE.MeshLambertMaterial({ color: 0x5a3a2a })
+        : new THREE.MeshStandardMaterial({ color: 0x5a3a2a, roughness: 0.9 });
+
+      const canopyMat = LITE
+        ? new THREE.MeshLambertMaterial({ color: 0x2d5a2d })
+        : new THREE.MeshStandardMaterial({ color: 0x2d5a2d, roughness: 0.85 });
+
+      const trunkInst = new THREE.InstancedMesh(trunkGeo, trunkMat, treeCount);
+      const canopyInst = new THREE.InstancedMesh(canopyGeo, canopyMat, treeCount);
+
+      trunkInst.castShadow = !LITE;
+      canopyInst.castShadow = !LITE;
+      trunkInst.receiveShadow = !LITE;
+      canopyInst.receiveShadow = !LITE;
+
+      let placed = 0;
+      let attempts = 0;
+      const MAX_ATTEMPTS = treeCount * 10;
+
+      while (placed < treeCount && attempts < MAX_ATTEMPTS) {
+        attempts++;
+        const x = (Math.random() - 0.5) * (TERRAIN_SIZE - 6);
+        const z = (Math.random() - 0.5) * (TERRAIN_SIZE - 6);
+
+        // 不在木屋周围 8 米内放树
+        if (Math.sqrt(x * x + z * z) < 8) continue;
+
+        const y = heightAt(x, z);
+        const scale = 0.7 + Math.random() * 0.9;
+
+        dummy.position.set(x, y, z);
+        dummy.scale.setScalar(scale);
+        dummy.rotation.y = Math.random() * Math.PI * 2;
+        dummy.updateMatrix();
+
+        trunkInst.setMatrixAt(placed, dummy.matrix);
+        canopyInst.setMatrixAt(placed, dummy.matrix);
+
+        // 树冠颜色微调，避免一片死绿
+        color.setHSL(0.25 + Math.random() * 0.08, 0.35 + Math.random() * 0.15, 0.25 + Math.random() * 0.12);
+        canopyInst.setColorAt(placed, color);
+
+        placed++;
+      }
+
+      trunkInst.count = placed;
+      canopyInst.count = placed;
+      trunkInst.instanceMatrix.needsUpdate = true;
+      canopyInst.instanceMatrix.needsUpdate = true;
+      if (canopyInst.instanceColor) canopyInst.instanceColor.needsUpdate = true;
+
+      scene.add(trunkInst, canopyInst);
+    }
+    addTrees();
+
+    // ======================================================================
+    // 8. 草地：InstancedMesh 草簇
+    // ======================================================================
+    function addGrass() {
+      const bladeGeo = new THREE.ConeGeometry(0.07, 0.3, 3); // 3 边锥体，顶点极少
+      const bladeMat = LITE
+        ? new THREE.MeshLambertMaterial({ color: 0x5a7a3a })
+        : new THREE.MeshStandardMaterial({ color: 0x5a7a3a, roughness: 0.9 });
+
+      const count = LITE ? 500 : 1600; // 移动端大幅减少草的数量
+      const grass = new THREE.InstancedMesh(bladeGeo, bladeMat, count);
+      const dummy = new THREE.Object3D();
+      const color = new THREE.Color();
+
+      grass.castShadow = !LITE;
+      grass.receiveShadow = !LITE;
+
+      for (let i = 0; i < count; i++) {
+        const x = (Math.random() - 0.5) * (TERRAIN_SIZE - 10);
+        const z = (Math.random() - 0.5) * (TERRAIN_SIZE - 10);
+        const y = heightAt(x, z);
+
+        dummy.position.set(x, y + 0.12, z);
+        dummy.rotation.y = Math.random() * Math.PI * 2;
+        dummy.scale.setScalar(0.6 + Math.random() * 0.7);
+        dummy.updateMatrix();
+        grass.setMatrixAt(i, dummy.matrix);
+
+        color.setHSL(0.22 + Math.random() * 0.06, 0.4, 0.28 + Math.random() * 0.12);
+        grass.setColorAt(i, color);
+      }
+
+      grass.instanceMatrix.needsUpdate = true;
+      if (grass.instanceColor) grass.instanceColor.needsUpdate = true;
+      scene.add(grass);
+    }
+    addGrass();
+
+    // ======================================================================
+    // 9. 木屋：GLTFLoader 加载，失败则程序化兜底
+    // ======================================================================
+    let cabin = null;
+    let cabinReady = false;
+
+    function buildProceduralCabin() {
+      const group = new THREE.Group();
+      const y0 = heightAt(0, 0);
+
+      const woodMat = LITE
+        ? new THREE.MeshLambertMaterial({ color: 0x7a5a3a })
+        : new THREE.MeshStandardMaterial({ color: 0x7a5a3a, roughness: 0.85 });
+
+      const roofMat = LITE
+        ? new THREE.MeshLambertMaterial({ color: 0x4a3a2a })
+        : new THREE.MeshStandardMaterial({ color: 0x4a3a2a, roughness: 0.9 });
+
+      const windowMat = LITE
+        ? new THREE.MeshBasicMaterial({ color: 0xffddaa })
+        : new THREE.MeshStandardMaterial({
+            color: 0xffddaa,
+            emissive: 0xffaa44,
+            emissiveIntensity: 0.6,
+            roughness: 0.4
+          });
+
+      const body = new THREE.Mesh(new THREE.BoxGeometry(3.2, 2.2, 2.8), woodMat);
+      body.position.set(0, y0 + 1.1, 0);
+      body.castShadow = !LITE;
+      body.receiveShadow = !LITE;
+      group.add(body);
+
+      const roof = new THREE.Mesh(new THREE.ConeGeometry(3.0, 1.6, 4), roofMat);
+      roof.position.set(0, y0 + 2.9, 0);
+      roof.rotation.y = Math.PI / 4;
+      roof.castShadow = !LITE;
+      group.add(roof);
+
+      const doorMat = LITE
+        ? new THREE.MeshLambertMaterial({ color: 0x3a2a1a })
+        : new THREE.MeshStandardMaterial({ color: 0x3a2a1a, roughness: 0.8 });
+
+      const door = new THREE.Mesh(new THREE.BoxGeometry(0.7, 1.4, 0.08), doorMat);
+      door.position.set(0, y0 + 0.7, 1.45);
+      group.add(door);
+
+      const win1 = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.6, 0.06), windowMat);
+      win1.position.set(1.0, y0 + 1.3, 1.45);
+      group.add(win1);
+
+      const win2 = win1.clone();
+      win2.position.set(-1.0, y0 + 1.3, 1.45);
+      group.add(win2);
+
+      return group;
+    }
+
+    function loadCabin() {
+      const loader = new GLTFLoader();
+
+      // 可替换为你自己的木屋 .glb 路径
+      // 这里使用 three.js 示例中的 LittlestTokyo 作为“可加载模型”的演示占位；
+      // 它的尺寸不适合当木屋，所以加载成功后会缩小并调整位置。
+      // 如果你有真正的 cabin.glb，把下面的 URL 换掉即可。
+      const CABIN_URL = 'https://threejs.org/examples/models/gltf/LittlestTokyo.glb';
+
+      loader.load(
+        CABIN_URL,
+        (gltf) => {
+          cabin = gltf.scene;
+          // LittlestTokyo 很大，需要大幅缩小并放到中心
+          // 如果你用自己的木屋，根据模型实际尺寸调整 scale
+          const box = new THREE.Box3().setFromObject(cabin);
+          const size = box.getSize(new THREE.Vector3());
+          const maxDim = Math.max(size.x, size.z);
+          const targetSize = 4; // 希望木屋占地约 4 个单位
+          const s = targetSize / maxDim;
+          cabin.scale.setScalar(s);
+
+          // 重新计算包围盒，让底部贴地
+          const box2 = new THREE.Box3().setFromObject(cabin);
+          const center = box2.getCenter(new THREE.Vector3());
+          const minY = box2.min.y;
+          const groundY = heightAt(0, 0);
+
+          cabin.position.x = -center.x;
+          cabin.position.z = -center.z;
+          cabin.position.y = groundY - minY;
+
+          cabin.traverse((child) => {
+            if (child.isMesh) {
+              child.castShadow = !LITE;
+              child.receiveShadow = !LITE;
+              if (child.material?.map) {
+                child.material.map.anisotropy = renderer.capabilities.getMaxAnisotropy();
+              }
+            }
+          });
+
+          scene.add(cabin);
+          cabinReady = true;
+          finishLoading();
+        },
+        undefined,
+        () => {
+          // 加载失败，使用程序化木屋
+          cabin = buildProceduralCabin();
+          scene.add(cabin);
+          cabinReady = true;
+          finishLoading();
+        }
+      );
+    }
+    loadCabin();
+
+    // ======================================================================
+    // 10. OrbitControls：桌面 / 移动端触控适配
+    // ======================================================================
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 2, 0);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;          // 桌面和移动端都用 0.06，手感自然
+    controls.enablePan = true;
+    controls.enableZoom = true;
+    controls.enableRotate = true;
+    controls.minDistance = 8;
+    controls.maxDistance = 60;
+    controls.maxPolarAngle = Math.PI / 2.15; // 防止相机钻到地下
+
+    // 移动端：单指旋转，双指缩放 + 平移（OrbitControls 默认行为，但显式设置更清晰）
+    // 桌面端：左键旋转，右键平移，滚轮缩放
+    if (isMobile) {
+      controls.touches.ONE = THREE.TOUCH.ROTATE;
+      controls.touches.TWO = THREE.TOUCH.DOLLY_PAN;
+    }
+
+    // 移动端触控时，阻止页面滚动干扰画布
+    // OrbitControls 在触摸设备上会自动设置 touch-action: none，这里再确保一次
+    renderer.domElement.style.touchAction = 'none';
+
+    controls.update();
+
+    // ======================================================================
+    // 11. 后处理：移动端关闭 Bloom，桌面保留轻微泛光
+    // ======================================================================
+    let composer = null;
+
+    if (!LITE) {
+      composer = new EffectComposer(renderer);
+      composer.addPass(new RenderPass(scene, camera));
+
+      const bloomPass = new UnrealBloomPass(
+        new THREE.Vector2(window.innerWidth, window.innerHeight),
+        0.35,  // strength
+        0.5,   // radius
+        0.88   // threshold
+      );
+      composer.addPass(bloomPass);
+      composer.addPass(new OutputPass());
+    }
+
+    // ======================================================================
+    // 12. 动画循环
+    // ======================================================================
+    const clock = new THREE.Clock();
+    let loaded = false;
+
+    function finishLoading() {
+      if (loaded) return;
+      loaded = true;
+      const el = document.getElementById('loading');
+      if (el) el.classList.add('hidden');
+    }
+
+    // 兜底：即使模型加载挂起，3 秒后也关闭 loading
+    setTimeout(finishLoading, 3000);
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = clock.getDelta();
+
+      controls.update(dt);
+
+      // 木屋窗户暖光呼吸（程序化木屋才有效；加载的 GLB 可能没有这个材质，遍历会安全跳过）
+      if (cabin) {
+        const t = clock.elapsedTime;
+        cabin.traverse((o) => {
+          if (
+            o.isMesh &&
+            o.material?.emissiveIntensity !== undefined &&
+            o.material?.emissive?.getHex?.() === 0xffaa44
+          ) {
+            o.material.emissiveIntensity = 0.45 + Math.sin(t * 1.6) * 0.25;
+          }
+        });
+      }
+
+      // 有后处理走 composer，没有就直接 renderer.render
+      if (composer) {
+        composer.render();
+      } else {
+        renderer.render(scene, camera);
+      }
+    }
+
+    animate();
+
+    // ======================================================================
+    // 13. 响应式：resize 时同步更新渲染器、相机、composer
+    // ======================================================================
+    window.addEventListener('resize', () => {
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(width, height);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, maxPixelRatio));
+
+      if (composer) {
+        composer.setSize(width, height);
+      }
+    });
+  </script>
+</body>
+</html>
